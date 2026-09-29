@@ -119,7 +119,7 @@ def cerca(s, search_url):
         print("Campi del primo annuncio:", sorted(items[0].keys()))
     else:
         print("Nessun annuncio. Chiavi risposta:", sorted(dati.keys()))
-    return base, items
+    return base, items, headers
 
 
 def brand_di(item):
@@ -128,6 +128,16 @@ def brand_di(item):
 
 def stato_di(item):
     return (item.get("status") or (item.get("item_box") or {}).get("second_line") or "")
+
+
+def link_di(item, base):
+    """Link completo e cliccabile all'annuncio, anche se l'API restituisce un percorso relativo o nulla."""
+    url = item.get("url") or ""
+    if url.startswith("/"):
+        url = base + url
+    if not url.startswith("http"):
+        url = f"{base}/items/{item.get('id')}"
+    return url
 
 
 def prezzo(item):
@@ -162,12 +172,77 @@ def valuta(item, p):
     return False, tag, score
 
 
-def telegram(msg):
+WATCH_RE = re.compile(
+    "orolog|watch|cronograf|chronograph|" + "|".join(re.escape(k) for k in BRANDS), re.I)
+
+
+def foto_di(item):
+    ph = item.get("photo")
+    if isinstance(ph, dict):
+        return ph.get("full_size_url") or ph.get("url")
+    phs = item.get("photos")
+    if isinstance(phs, list) and phs and isinstance(phs[0], dict):
+        return phs[0].get("full_size_url") or phs[0].get("url")
+    return None
+
+
+def armadio(s, base, headers, user_id, catalogo, cache):
+    """(articoli totali, orologi trovati, elenco parziale?) oppure None se non disponibile."""
+    if not user_id:
+        return None
+    if user_id in cache:
+        return cache[user_id]
+    res = None
+    try:
+        time.sleep(random.uniform(0.5, 1.5))
+        r = s.get(f"{base}/api/v2/wardrobe/{user_id}/items",
+                  params={"page": 1, "per_page": 96}, headers=headers, timeout=20)
+        if r.ok:
+            d = r.json()
+            its = d.get("items") or []
+            tot = (d.get("pagination") or {}).get("total_entries", len(its))
+            n = sum(1 for x in its
+                    if (catalogo and str(x.get("catalog_id")) == catalogo)
+                    or WATCH_RE.search(x.get("title") or "")
+                    or WATCH_RE.search(x.get("brand_title") or ""))
+            res = (tot, n, tot > len(its))
+        else:
+            print(f"Armadio venditore {user_id}: HTTP {r.status_code}")
+    except Exception as e:  # dato accessorio: mai bloccare l'avviso
+        print(f"Armadio venditore {user_id} non leggibile: {e}")
+    cache[user_id] = res
+    return res
+
+
+def riga_armadio(info):
+    if not info:
+        return "👜 Armadio venditore: dato non disponibile"
+    tot, n, parziale = info
+    piu = "+" if parziale else ""
+    if n >= 5:
+        return (f"👜 Molti orologi nell'armadio: {n}{piu} su {tot} articoli "
+                f"(questo incluso) → venditore abituale")
+    return (f"👜 Meno di 5 orologi nell'armadio: {n} su {tot} articoli "
+            f"(questo incluso) → probabile privato"
+            + (" (controllati i primi 96)" if parziale else ""))
+
+
+def telegram(msg, foto=None):
     token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
-    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat, "text": msg, "parse_mode": "HTML",
-                            "disable_web_page_preview": "false"}, timeout=20)
-    r.raise_for_status()
+    api = f"https://api.telegram.org/bot{token}"
+    inviato = False
+    if foto and len(msg) <= 1024:  # limite Telegram per le didascalie
+        r = requests.post(f"{api}/sendPhoto",
+                          data={"chat_id": chat, "photo": foto, "caption": msg,
+                                "parse_mode": "HTML"}, timeout=30)
+        inviato = r.ok
+        if not r.ok:
+            print(f"sendPhoto fallito ({r.status_code}): {r.text[:200]}")
+    if not inviato:
+        r = requests.post(f"{api}/sendMessage",
+                          data={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
+                          timeout=20)
+        r.raise_for_status()
     time.sleep(1)
 
 
@@ -178,7 +253,10 @@ def main():
 
     s = sessione()
     time.sleep(random.uniform(1, 4))
-    base, items = cerca(s, search_url)
+    base, items, headers = cerca(s, search_url)
+    catalogo = next((v for k, v in parse_qsl(urlparse(search_url).query)
+                     if k in ("catalog[]", "catalog_ids[]", "catalog_ids")), None)
+    cache_armadi = {}
     print(f"{len(items)} annunci ricevuti")
 
     da_notificare = []
@@ -216,8 +294,9 @@ def main():
             if rep is not None:
                 righe.append(f"⭐ venditore: {float(rep) * 5:.1f}/5")
             righe += tag
-            righe.append(it.get("url") or f"{base}/items/{it.get('id')}")
-            telegram("\n".join(righe))
+            righe.append(riga_armadio(armadio(s, base, headers, user.get("id"), catalogo, cache_armadi)))
+            righe.append(f'🔗 <a href="{html.escape(link_di(it, base), quote=True)}">Apri su Vinted</a>')
+            telegram("\n".join(righe), foto_di(it))
         print(f"{len(da_notificare)} avvisi inviati")
     else:
         print("Primo giro: annunci registrati senza notifiche.")
