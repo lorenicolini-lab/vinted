@@ -8,6 +8,7 @@ import html
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -61,20 +62,72 @@ def sessione():
     return s
 
 
+FILTRI = {  # parametro dell'URL del sito -> nome nella nuova API (attribute_ids[...])
+    "catalog[]": "catalog", "catalog_ids[]": "catalog", "catalog_ids": "catalog",
+    "brand_ids[]": "brand", "brand_ids": "brand",
+    "size_ids[]": "size", "size_ids": "size",
+    "status_ids[]": "status", "status_ids": "status",
+}
+PASSA = ("price_from", "price_to", "currency", "search_text")
+
+
 def cerca(s, search_url):
     u = urlparse(search_url)
     base = f"{u.scheme}://{u.netloc}"
-    s.get(base, timeout=20)  # ottiene i cookie di sessione
-    params = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
-              if k not in ("order", "page", "per_page", "time")]
-    params += [("order", "newest_first"), ("per_page", "96"), ("page", "1")]
-    r = s.get(f"{base}/api/v2/catalog/items", params=params,
-              headers={"Accept": "application/json"}, timeout=20)
+    api = f"{u.scheme}://{u.netloc.replace('www.', 'api.', 1)}"
+
+    # Sessione anonima dal sito: cookie access_token_web + header X-Anon-Id (+ CSRF se presente)
+    r0 = s.get(base, timeout=20)
+    headers = {"Accept": "application/json", "Origin": base, "Referer": base + "/"}
+    if r0.headers.get("X-Anon-Id"):
+        headers["X-Anon-Id"] = r0.headers["X-Anon-Id"]
+    m = (re.search(r'name=["\']csrf-token["\'] content=["\']([^"\']+)', r0.text)
+         or re.search(r'"CSRF_TOKEN"\s*:\s*"([^"]+)"', r0.text, re.I))
+    if m:
+        headers["X-Csrf-Token"] = m.group(1)
+
+    attr, extra = {}, []
+    for k, v in parse_qsl(u.query, keep_blank_values=False):
+        if k in FILTRI:
+            attr.setdefault(FILTRI[k], []).append(v)
+        elif k in PASSA:
+            extra.append((k, v))
+    extra += [("order", "newest_first"), ("per_page", "96"), ("page", "1")]
+
+    def richiesta(virgole):
+        params = list(extra)
+        for nome, vals in attr.items():
+            if virgole:
+                params.append((f"attribute_ids[{nome}]", ",".join(vals)))
+            else:
+                params += [(f"attribute_ids[{nome}]", v) for v in vals]
+        return s.get(f"{api}/svc-catalogue/items", params=params, headers=headers, timeout=20)
+
+    r = richiesta(virgole=False)
+    if r.status_code in (400, 422):  # formato dei filtri diverso: riprova con valori separati da virgola
+        r = richiesta(virgole=True)
     if r.status_code in (401, 403, 429):
-        print(f"Bloccato da Vinted (HTTP {r.status_code}). Probabile blocco IP.", file=sys.stderr)
+        print(f"Bloccato da Vinted (HTTP {r.status_code}). Probabile blocco IP o sessione rifiutata.",
+              file=sys.stderr)
         sys.exit(1)
-    r.raise_for_status()
-    return base, r.json().get("items", [])
+    if not r.ok:
+        print(f"Errore HTTP {r.status_code}: {r.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+    dati = r.json()
+    items = dati.get("items") or dati.get("catalog_items") or []
+    if items:
+        print("Campi del primo annuncio:", sorted(items[0].keys()))
+    else:
+        print("Nessun annuncio. Chiavi risposta:", sorted(dati.keys()))
+    return base, items
+
+
+def brand_di(item):
+    return (item.get("brand_title") or (item.get("item_box") or {}).get("first_line") or "")
+
+
+def stato_di(item):
+    return (item.get("status") or (item.get("item_box") or {}).get("second_line") or "")
 
 
 def prezzo(item):
@@ -90,7 +143,7 @@ def prezzo(item):
 def valuta(item, p):
     """Ritorna (scartare, etichette, punteggio)."""
     titolo = (item.get("title") or "").lower()
-    brand = (item.get("brand_title") or "").lower()
+    brand = brand_di(item).lower()
     if any(w in titolo for w in ESCLUDI):
         return True, [], 0
     tag, score = [], 0
@@ -142,6 +195,9 @@ def main():
             seen[iid] = None
         if not (nuovo or calo):
             continue
+        if p is None:
+            print(f"Annuncio {iid} senza prezzo leggibile, saltato")
+            continue
         scarta, tag, score = valuta(it, p)
         if scarta:
             continue
@@ -155,7 +211,7 @@ def main():
                 ("📉 <b>PREZZO IN CALO</b>" if calo else "🆕 <b>Nuovo annuncio</b>"),
                 html.escape(it.get("title") or ""),
                 f"💶 {p:.0f} €" + (f" (era {vecchio:.0f} €)" if calo and vecchio else ""),
-                f"🏷 {html.escape(it.get('brand_title') or '?')} · {html.escape(str(it.get('status') or ''))}",
+                f"🏷 {html.escape(brand_di(it) or '?')} · {html.escape(str(stato_di(it)))}",
             ]
             if rep is not None:
                 righe.append(f"⭐ venditore: {float(rep) * 5:.1f}/5")
