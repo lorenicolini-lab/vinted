@@ -26,6 +26,7 @@ SCARTA_ARMADIO_VUOTO = False     # True = non avvisare se l'armadio del venditor
 # Soglie di partenza indicative: da tarare in base a quello che vedi davvero.
 # Paesi da cui accetti annunci (codici a 2 lettere). Lista vuota [] = nessun filtro.
 # Esempi: "GB" Regno Unito, "CH" Svizzera, "PL" Polonia, "US" Stati Uniti.
+SCARTA_PAESE_SCONOSCIUTO = False  # True = scarta anche gli annunci di cui non si legge il Paese
 PAESI_AMMESSI = ["IT", "FR", "DE", "ES", "PT", "NL", "BE", "LU", "AT"]
 
 NOMI_PAESI = {
@@ -234,6 +235,61 @@ def armadio(s, base, headers, user_id, catalogo, cache):
     return res
 
 
+def trova_paese(obj):
+    """Cerca in un JSON (anche annidato) qualsiasi chiave che contenga 'country'. Ritorna (codice, nome)."""
+    ris = {"cod": None, "nome": None}
+
+    def walk(o, depth):
+        if depth > 4:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kl = str(k).lower()
+                if "country" in kl:
+                    if isinstance(v, dict):
+                        ris["cod"] = ris["cod"] or v.get("iso_code") or v.get("code") or v.get("iso")
+                        ris["nome"] = ris["nome"] or v.get("title") or v.get("name")
+                    elif isinstance(v, str) and v.strip():
+                        if "iso" in kl or "code" in kl:
+                            ris["cod"] = ris["cod"] or v
+                        else:
+                            ris["nome"] = ris["nome"] or v
+                elif isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
+        elif isinstance(o, list):
+            for x in o[:20]:
+                walk(x, depth + 1)
+
+    walk(obj, 0)
+    return ris["cod"], ris["nome"]
+
+
+def profilo_venditore(s, base, headers, user_id, cache, diag):
+    """(codice, nome paese, città) dal profilo del venditore; None se non disponibile."""
+    if not user_id:
+        return None
+    if user_id in cache:
+        return cache[user_id]
+    res = None
+    try:
+        time.sleep(random.uniform(0.3, 1.0))
+        r = s.get(f"{base}/api/v2/users/{user_id}", headers=headers, timeout=20)
+        if r.ok:
+            j = r.json()
+            u = j.get("user") or j
+            if not diag:
+                print("Campi profilo venditore:", sorted(u.keys()))
+                diag.append(1)
+            cod, nome = trova_paese(u)
+            res = (cod, nome, u.get("city"))
+        else:
+            print(f"Profilo venditore {user_id}: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"Profilo venditore {user_id} non leggibile: {e}")
+    cache[user_id] = res
+    return res
+
+
 def dettaglio(s, base, headers, item_id, diag):
     """Stato dell'annuncio e recensioni del venditore. None se il dato non è disponibile."""
     try:
@@ -267,11 +323,7 @@ def dettaglio(s, base, headers, item_id, diag):
                                     "negative_feedback_count")]
         if any(x is not None for x in parti):
             fb = sum(x or 0 for x in parti)
-    nome = u.get("country_title") or d.get("country_title") or d.get("country")
-    if isinstance(nome, dict):
-        nome = nome.get("title") or nome.get("name")
-    cod = (u.get("country_iso_code") or u.get("country_code")
-           or d.get("country_iso_code") or d.get("country_code"))
+    cod, nome = trova_paese(d)
     citta = u.get("city") or d.get("city")
     return {"motivo": motivo, "feedback": fb, "cod": cod, "nome": nome, "citta": citta}
 
@@ -359,6 +411,7 @@ def main():
 
     if not primo_giro:
         diag, inviati = [], 0
+        cache_profili, diag_profilo = {}, []
         for score, it, p, tag, calo, vecchio in sorted(da_notificare, key=lambda x: -x[0]):
             user = it.get("user") or {}
             tag = list(tag)
@@ -367,13 +420,20 @@ def main():
             if det and det["motivo"]:
                 print(f"Scartato {it.get('id')}: {det['motivo']}")
                 continue
-            cod, nome_paese = norm_paese(
-                (det or {}).get("cod") or user.get("country_iso_code") or user.get("country_code"),
-                (det or {}).get("nome") or user.get("country_title"))
+            c1, n1 = trova_paese(user)
+            cod, nome_paese = norm_paese((det or {}).get("cod") or c1, (det or {}).get("nome") or n1)
             citta = (det or {}).get("citta") or user.get("city")
+            if not cod:  # ultimo tentativo: profilo del venditore
+                pv = profilo_venditore(s, base, headers, user.get("id"), cache_profili, diag_profilo)
+                if pv:
+                    cod, nome_paese = norm_paese(pv[0] or cod, pv[1] or nome_paese)
+                    citta = citta or pv[2]
             print(f"Paese annuncio {it.get('id')}: {cod} / {nome_paese} / {citta}")
             if PAESI_AMMESSI and cod and cod not in PAESI_AMMESSI:
                 print(f"Scartato {it.get('id')}: paese {cod} non ammesso")
+                continue
+            if PAESI_AMMESSI and not cod and SCARTA_PAESE_SCONOSCIUTO:
+                print(f"Scartato {it.get('id')}: paese non leggibile")
                 continue
             fb = det["feedback"] if det and det["feedback"] is not None else user.get("feedback_count")
             if fb == 0:
