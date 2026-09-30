@@ -19,6 +19,8 @@ import requests
 SEEN_FILE = Path("seen.json")
 MAX_SEEN = 5000
 DROP_PCT = 0.10  # avvisa di nuovo se il prezzo scende almeno del 10%
+SCARTA_SENZA_RECENSIONI = False  # True = non avvisare per venditori con 0 recensioni (altrimenti solo ⚠️)
+SCARTA_ARMADIO_VUOTO = False     # True = non avvisare se l'armadio del venditore risulta vuoto
 
 # brand: (sotto questa cifra = sospetto fake, sotto questa cifra = possibile affare)
 # Soglie di partenza indicative: da tarare in base a quello che vedi davvero.
@@ -214,6 +216,42 @@ def armadio(s, base, headers, user_id, catalogo, cache):
     return res
 
 
+def dettaglio(s, base, headers, item_id, diag):
+    """Stato dell'annuncio e recensioni del venditore. None se il dato non è disponibile."""
+    try:
+        time.sleep(random.uniform(0.3, 1.0))
+        r = s.get(f"{base}/api/v2/items/{item_id}", headers=headers, timeout=20)
+        if not r.ok:
+            print(f"Dettaglio {item_id}: HTTP {r.status_code}")
+            return None
+        j = r.json()
+        d = j.get("item") or j
+    except Exception as e:  # dato accessorio: mai bloccare l'avviso
+        print(f"Dettaglio {item_id} non leggibile: {e}")
+        return None
+    if not diag:
+        print("Campi dettaglio:", sorted(d.keys()))
+        print("Campi venditore:", sorted((d.get("user") or {}).keys()))
+        diag.append(1)
+    motivo = None
+    if d.get("is_closed"):
+        motivo = "venduto/chiuso"
+    elif d.get("is_reserved"):
+        motivo = "prenotato"
+    elif d.get("is_hidden"):
+        motivo = "nascosto"
+    elif d.get("can_buy") is False:
+        motivo = "non acquistabile"
+    u = d.get("user") or {}
+    fb = u.get("feedback_count")
+    if fb is None:
+        parti = [u.get(k) for k in ("positive_feedback_count", "neutral_feedback_count",
+                                    "negative_feedback_count")]
+        if any(x is not None for x in parti):
+            fb = sum(x or 0 for x in parti)
+    return {"motivo": motivo, "feedback": fb}
+
+
 def riga_armadio(info):
     if not info:
         return "👜 Armadio venditore: dato non disponibile"
@@ -282,8 +320,30 @@ def main():
         da_notificare.append((score, it, p, tag, calo, vecchio))
 
     if not primo_giro:
+        diag, inviati = [], 0
         for score, it, p, tag, calo, vecchio in sorted(da_notificare, key=lambda x: -x[0]):
             user = it.get("user") or {}
+            tag = list(tag)
+
+            det = dettaglio(s, base, headers, it.get("id"), diag)
+            if det and det["motivo"]:
+                print(f"Scartato {it.get('id')}: {det['motivo']}")
+                continue
+            fb = det["feedback"] if det and det["feedback"] is not None else user.get("feedback_count")
+            if fb == 0:
+                if SCARTA_SENZA_RECENSIONI:
+                    print(f"Scartato {it.get('id')}: venditore senza recensioni")
+                    continue
+                tag.append("⚠️ venditore senza recensioni")
+
+            info = armadio(s, base, headers, user.get("id"), catalogo, cache_armadi)
+            print(f"Armadio venditore {user.get('id')}: {info}")
+            if info and info[0] == 0:
+                if SCARTA_ARMADIO_VUOTO:
+                    print(f"Scartato {it.get('id')}: armadio vuoto")
+                    continue
+                tag.append("⚠️ armadio vuoto: annuncio forse chiuso o account sospeso")
+
             rep = user.get("feedback_reputation")
             righe = [
                 ("📉 <b>PREZZO IN CALO</b>" if calo else "🆕 <b>Nuovo annuncio</b>"),
@@ -294,10 +354,11 @@ def main():
             if rep is not None:
                 righe.append(f"⭐ venditore: {float(rep) * 5:.1f}/5")
             righe += tag
-            righe.append(riga_armadio(armadio(s, base, headers, user.get("id"), catalogo, cache_armadi)))
+            righe.append(riga_armadio(info))
             righe.append(f'🔗 <a href="{html.escape(link_di(it, base), quote=True)}">Apri su Vinted</a>')
             telegram("\n".join(righe), foto_di(it))
-        print(f"{len(da_notificare)} avvisi inviati")
+            inviati += 1
+        print(f"{inviati} avvisi inviati su {len(da_notificare)} candidati")
     else:
         print("Primo giro: annunci registrati senza notifiche.")
 
