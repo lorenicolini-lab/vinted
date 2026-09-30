@@ -24,6 +24,24 @@ SCARTA_ARMADIO_VUOTO = False     # True = non avvisare se l'armadio del venditor
 
 # brand: (sotto questa cifra = sospetto fake, sotto questa cifra = possibile affare)
 # Soglie di partenza indicative: da tarare in base a quello che vedi davvero.
+# Paesi da cui accetti annunci (codici a 2 lettere). Lista vuota [] = nessun filtro.
+# Esempi: "GB" Regno Unito, "CH" Svizzera, "PL" Polonia, "US" Stati Uniti.
+PAESI_AMMESSI = ["IT", "FR", "DE", "ES", "PT", "NL", "BE", "LU", "AT"]
+
+NOMI_PAESI = {
+    "IT": "Italia", "FR": "Francia", "DE": "Germania", "ES": "Spagna", "PT": "Portogallo",
+    "NL": "Paesi Bassi", "BE": "Belgio", "LU": "Lussemburgo", "AT": "Austria", "PL": "Polonia",
+    "CZ": "Rep. Ceca", "SK": "Slovacchia", "HU": "Ungheria", "RO": "Romania", "BG": "Bulgaria",
+    "GR": "Grecia", "HR": "Croazia", "SI": "Slovenia", "LT": "Lituania", "LV": "Lettonia",
+    "EE": "Estonia", "FI": "Finlandia", "SE": "Svezia", "DK": "Danimarca", "IE": "Irlanda",
+    "GB": "Regno Unito", "CH": "Svizzera", "US": "Stati Uniti", "MT": "Malta", "CY": "Cipro",
+}
+_EN = {"italy": "IT", "france": "FR", "germany": "DE", "spain": "ES", "portugal": "PT",
+       "netherlands": "NL", "belgium": "BE", "luxembourg": "LU", "austria": "AT",
+       "poland": "PL", "united kingdom": "GB", "switzerland": "CH", "united states": "US",
+       "usa": "US", "stati uniti": "US", "germania": "DE", "francia": "FR", "spagna": "ES"}
+NOME_A_COD = {**{v.lower(): k for k, v in NOMI_PAESI.items()}, **_EN}
+
 BRANDS = {
     "seiko": (20, 150),
     "grand seiko": (250, 400),
@@ -249,7 +267,27 @@ def dettaglio(s, base, headers, item_id, diag):
                                     "negative_feedback_count")]
         if any(x is not None for x in parti):
             fb = sum(x or 0 for x in parti)
-    return {"motivo": motivo, "feedback": fb}
+    nome = u.get("country_title") or d.get("country_title") or d.get("country")
+    if isinstance(nome, dict):
+        nome = nome.get("title") or nome.get("name")
+    cod = (u.get("country_iso_code") or u.get("country_code")
+           or d.get("country_iso_code") or d.get("country_code"))
+    citta = u.get("city") or d.get("city")
+    return {"motivo": motivo, "feedback": fb, "cod": cod, "nome": nome, "citta": citta}
+
+
+def norm_paese(cod, nome):
+    cod = str(cod).strip() if cod else None
+    nome = str(nome).strip() if nome else None
+    if cod and len(cod) != 2:  # es. "Italy": è un nome, non un codice
+        nome, cod = nome or cod, None
+    if cod:
+        cod = cod.upper()
+    elif nome:
+        cod = NOME_A_COD.get(nome.lower())
+    if cod and not nome:
+        nome = NOMI_PAESI.get(cod, cod)
+    return cod, nome
 
 
 def riga_armadio(info):
@@ -329,6 +367,14 @@ def main():
             if det and det["motivo"]:
                 print(f"Scartato {it.get('id')}: {det['motivo']}")
                 continue
+            cod, nome_paese = norm_paese(
+                (det or {}).get("cod") or user.get("country_iso_code") or user.get("country_code"),
+                (det or {}).get("nome") or user.get("country_title"))
+            citta = (det or {}).get("citta") or user.get("city")
+            print(f"Paese annuncio {it.get('id')}: {cod} / {nome_paese} / {citta}")
+            if PAESI_AMMESSI and cod and cod not in PAESI_AMMESSI:
+                print(f"Scartato {it.get('id')}: paese {cod} non ammesso")
+                continue
             fb = det["feedback"] if det and det["feedback"] is not None else user.get("feedback_count")
             if fb == 0:
                 if SCARTA_SENZA_RECENSIONI:
@@ -351,6 +397,10 @@ def main():
                 f"💶 {p:.0f} €" + (f" (era {vecchio:.0f} €)" if calo and vecchio else ""),
                 f"🏷 {html.escape(brand_di(it) or '?')} · {html.escape(str(stato_di(it)))}",
             ]
+            if cod or nome_paese:
+                righe.append("🌍 " + html.escape(nome_paese or cod) + (f", {html.escape(str(citta))}" if citta else ""))
+            else:
+                righe.append("🌍 Paese non disponibile" + (" (filtro paesi non applicato)" if PAESI_AMMESSI else ""))
             if rep is not None:
                 righe.append(f"⭐ venditore: {float(rep) * 5:.1f}/5")
             righe += tag
